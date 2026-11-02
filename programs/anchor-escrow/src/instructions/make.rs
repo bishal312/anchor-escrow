@@ -1,6 +1,6 @@
 // Imports and dependencies
 
-use crate::errors::EscrowError;
+use crate::error::EscrowError;
 use crate::state::Escrow;
 use anchor_lang::prelude::*;
 
@@ -27,11 +27,11 @@ pub struct Make<'info> {
         bump,
     )]
 
-    pub escrow: Account<'info, Escrow>
+    pub escrow: Account<'info, Escrow>,
     #[account(
         mint::token_program=token_program,
     )]
-    pub mint_a: InterfaceAccount<'info, Mint>
+    pub mint_a: InterfaceAccount<'info, Mint>,
     #[account(
         mint::token_program=token_program,
     )]
@@ -57,54 +57,54 @@ pub struct Make<'info> {
     pub associated_token_program: Program<'info, AssociatedToken>,
     pub token_program: Interface<'info, TokenInterface>,
     pub system_program: Program<'info, System>,
+}
 
-    // Helper implementation Block
-    impl<'info> Make<'info> {
-        // populate_escrow: Writes the trade parameters (seed, maker address, token types, requested amount (receive), and the PDA bump) directly into the newly created escrow account space.
-        fn populate_escrow(&mut self, seed: u64, amount: u64, bump: u8) -> Result<()> {
-            self.escrow.set_inner(Escrow {
-                seed,
-                maker: self.maker.key(),
-                mint_a: self.mint_a.key(),
-                mint_b: self.mint_b.key(),
-                receive: amount,
-                bump,
-            });
-            Ok(())
-        }
-
-        //deposite_tokens: Executes a Cross-Program Invocation (CPI) to the Token Program using transfer_checked. It securely moves the specified amount of Token A from the maker's wallet (maker_ata_a) into the escrow's holding vault (vault), verifying token decimals.
-        fn deposite_tokens(&mut self, amount: u64) -> Result<()> {
-            transfer_checked(
-                CpiContext::new(
-                    self.token_program.key(),
-                    TransferChecked {
-                        from: self.maker_ata_a.to_account_info(),
-                        mint: self.mint_a.to_account_info(),
-                        to: self.vault.to_account_info(),
-                        authority: self.maker.to_account_info(),
-                    },
-                ),
-                amount,
-                self.mint_a.decimals,
-            )?;
-            Ok(())
-        }
-    }
-
-    // the main instruction handler
-    pub fn handler(ctx: Context<Make>, seed: u64, receive: u64, amount: u64) -> Result<()> {
-
-        // Validation Checks: Uses require_gt! macro to ensure both the amount requested (receive) and the amount deposited (amount) are strictly greater than 0, returning a custom EscrowError::InvalidAmount if invalid.
-        require_gt!(receive, 0, EscrowError::InvalidAmount);
-        require_gt!(amount, 0, EscrowError::InvalidAmount);
-
-        // State Initialization: Calls populate_escrow to save trade metadata onto the escrow account, passing the automatically generated PDA bump (ctx.bumps.escrow).
-        ctx.account
-            .populate_escrow(seed, receive, ctx.bumps.escrow)?;
-
-        // Token Transfer: Calls deposite_tokens to transfer the Maker's tokens into the escrow vault.
-        ctx.accounts.deposite_tokens(amount)?;
+// Helper implementation Block
+impl<'info> Make<'info> {
+    // populate_escrow: Writes the trade parameters (seed, maker address, token types, requested amount (receive), and the PDA bump) directly into the newly created escrow account space.
+    fn populate_escrow(&mut self, seed: u64, amount: u64, bump: u8) -> Result<()> {
+        self.escrow.set_inner(Escrow {
+            seed,
+            maker: self.maker.key(),
+            mint_a: self.mint_a.key(),
+            mint_b: self.mint_b.key(),
+            receive: amount,
+            bump,
+        });
         Ok(())
     }
+
+    //deposite_tokens: Executes a Cross-Program Invocation (CPI) to the Token Program using transfer_checked. It securely moves the specified amount of Token A from the maker's wallet (maker_ata_a) into the escrow's holding vault (vault), verifying token decimals.
+    fn deposite_tokens(&mut self, amount: u64) -> Result<()> {
+        transfer_checked(
+            CpiContext::new(
+                self.token_program.key(),
+                TransferChecked {
+                    from: self.maker_ata_a.to_account_info(),
+                    mint: self.mint_a.to_account_info(),
+                    to: self.vault.to_account_info(),
+                    authority: self.maker.to_account_info(),
+                },
+            ),
+            amount,
+            self.mint_a.decimals,
+        )?;
+        Ok(())
+    }
+}
+
+// the main instruction handler
+pub fn handler(ctx: Context<Make>, seed: u64, receive: u64, amount: u64) -> Result<()> {
+
+    // Validation Checks: Uses require_gt! macro to ensure both the amount requested (receive) and the amount deposited (amount) are strictly greater than 0, returning a custom EscrowError::InvalidAmount if invalid.
+    require_gt!(receive, 0, EscrowError::InvalidAmount);
+    require_gt!(amount, 0, EscrowError::InvalidAmount);
+
+    // State Initialization: Calls populate_escrow to save trade metadata onto the escrow account, passing the automatically generated PDA bump (ctx.bumps.escrow).
+    ctx.accounts
+        .populate_escrow(seed, receive, ctx.bumps.escrow)?;
+
+    // Token Transfer: Calls deposite_tokens to transfer the Maker's tokens into the escrow vault.
+    ctx.accounts.deposite_tokens(amount)?;
+    Ok(())
 }

@@ -7,7 +7,7 @@ pub enum EscrowError {
     #[msg("Invalid maker")]
     InvalidMaker,
     #[msg("Invalid min a")]
-    InvalidMinA,
+    InvalidMintA,
     #[msg("Invalid mint b")]
-    InvalidMinB,
+    InvalidMintB,
 }
