@@ -12,99 +12,142 @@ use anchor_spl::{
 
 // Make Accounts
 #[derive(Accounts)]
-#[instruction(seed: u64)]
-pub struct Make<'info> {
+pub struct Take<'info> {
+    // The user fulfilling the escrow offer. They sign the transaction and pay rent for new accounts.
     #[account(mut)]
-    pub maker: Signer<'info>,
-    #[account(
-        init,
-        payer=maker,
-        space=Escrow::INIT_SPACE + Escrow::DISCRIMINATOR.len(),
-        
-        //Derives a unique address using the literal string "escrow", the maker's wallet address, and a unique seed number provided by the user. This allows a maker to create multiple distinct escrows.
-        seeds=[b"escrow", maker.key().as_ref(), seed.to_le_bytes().as_ref()],
+    pub taker: Signer<'info>,
 
-        bump,
-    )]
+    // The original creator of the escrow. Marked as a SystemAccount because they will receive 
+    // the rent lamports when the escrow and vault accounts are closed.
+    #[account(mut)]
+    pub maker: SystemAccount<'info>,
 
-    pub escrow: Account<'info, Escrow>,
-    #[account(
-        mint::token_program=token_program,
-    )]
-    pub mint_a: InterfaceAccount<'info, Mint>,
-    #[account(
-        mint::token_program=token_program,
-    )]
-    pub mint_b: InterfaceAccount<'info, Mint>,
+    // The Escrow state PDA holding all trade rules and metadata.
     #[account(
         mut,
-        associated_token::mint=mint_a,
-        associated_token::authority=maker,
-        associated_token::token_program=token_program,
+        close = maker, // Closes this escrow account upon completion and refunds remaining rent to the maker
+        seeds = [b"escrow", maker.key().as_ref(), escrow.seed.to_le_bytes().as_ref()],
+        bump = escrow.bump,
+        // Security constraints ensuring the accounts passed match what was originally saved in the escrow state
+        has_one = maker @ EscrowError::InvalidMaker,
+        has_one = mint_a @ EscrowError::InvalidMintA,
+        has_one = mint_b @ EscrowError::InvalidMintB,
     )]
-    pub maker_ata_a: InterfaceAccount<'info, TokenAccount>, //Maker's Associated Token Account
+    pub escrow: Box<Account<'info, Escrow>>,
+
+    // Mint definitions for Token A (offered) and Token B (requested)
+    pub mint_a: Box<InterfaceAccount<'info, Mint>>,
+    pub mint_b: Box<InterfaceAccount<'info, Mint>>,
+
+    // The token vault owned by the escrow PDA that holds the Maker's Token A
+    #[account(
+        mut,
+        associated_token::mint = mint_a,
+        associated_token::authority = escrow,
+        associated_token::token_program = token_program,
+    )]
+    pub vault: Box<InterfaceAccount<'info, TokenAccount>>,
+
+    // Taker's Associated Token Account for Token A (initialized here to receive the offered tokens)
     #[account(
         init,
-        payer=maker,
+        payer = taker,
         associated_token::mint = mint_a,
-        associated_token::authority=escrow,
-        associated_token::token_program=token_program,
+        associated_token::authority = taker,
+        associated_token::token_program = token_program,
     )]
-    pub vault: InterfaceAccount<'info, TokenAccount>, //This vault acts as the secure holding box where the offered tokens sit.
+    pub taker_ata_a: Box<InterfaceAccount<'info, TokenAccount>>,
 
+    // Taker's Associated Token Account for Token B (from which payment will be sent to the maker)
+    #[account(
+       mut,
+       associated_token::mint = mint_b,
+       associated_token::authority = taker,
+       associated_token::token_program = token_program,
+    )]
+    pub taker_ata_b: Box<InterfaceAccount<'info, TokenAccount>>,
 
-    // Program references required by Solana and Anchor to initialize accounts and manage token transfers
+    // Maker's Associated Token Account for Token B (initialized here to receive payment from the taker)
+    #[account(
+        init,
+        payer = taker,
+        associated_token::mint = mint_b,
+        associated_token::authority = maker,
+        associated_token::token_program = token_program,
+    )]
+    pub maker_ata_b: Box<InterfaceAccount<'info, TokenAccount>>,
+
+    // Required system and token program references
     pub associated_token_program: Program<'info, AssociatedToken>,
     pub token_program: Interface<'info, TokenInterface>,
     pub system_program: Program<'info, System>,
 }
 
-// Helper implementation Block
-impl<'info> Make<'info> {
-    // populate_escrow: Writes the trade parameters (seed, maker address, token types, requested amount (receive), and the PDA bump) directly into the newly created escrow account space.
-    fn populate_escrow(&mut self, seed: u64, amount: u64, bump: u8) -> Result<()> {
-        self.escrow.set_inner(Escrow {
-            seed,
-            maker: self.maker.key(),
-            mint_a: self.mint_a.key(),
-            mint_b: self.mint_b.key(),
-            receive: amount,
-            bump,
-        });
-        Ok(())
-    }
-
-    //deposite_tokens: Executes a Cross-Program Invocation (CPI) to the Token Program using transfer_checked. It securely moves the specified amount of Token A from the maker's wallet (maker_ata_a) into the escrow's holding vault (vault), verifying token decimals.
-    fn deposite_tokens(&mut self, amount: u64) -> Result<()> {
+impl<'info> Take<'info> {
+    // Step 1: Transfers Token B from the Taker's wallet to the Maker's Token B ATA
+    fn transfer_to_maker(&mut self) -> Result<()> {
         transfer_checked(
             CpiContext::new(
                 self.token_program.key(),
                 TransferChecked {
-                    from: self.maker_ata_a.to_account_info(),
-                    mint: self.mint_a.to_account_info(),
-                    to: self.vault.to_account_info(),
-                    authority: self.maker.to_account_info(),
+                    from: self.taker_ata_b.to_account_info(),
+                    to: self.maker_ata_b.to_account_info(),
+                    mint: self.mint_b.to_account_info(),
+                    authority: self.taker.to_account_info(),
                 },
             ),
-            amount,
+            self.escrow.receive, // The exact amount of Token B requested by the maker
+            self.mint_b.decimals,
+        )?;
+        Ok(())
+    }
+
+    // Step 2: Withdraws Token A from the escrow vault to the Taker, then cleans up accounts
+    fn withdraw_and_close_vault(&mut self) -> Result<()> {
+        // Construct the PDA signing seeds so the program can authorize actions on behalf of the Escrow PDA
+        let signer_seeds: [&[&[u8]]; 1] = [&[
+            b"escrow",
+            self.maker.to_account_info().key.as_ref(),
+            &self.escrow.seed.to_le_bytes()[..],
+            &[self.escrow.bump],
+        ]];
+
+        // Transfer all Token A out of the escrow vault into the Taker's Token A ATA using PDA signature
+        transfer_checked(
+            CpiContext::new_with_signer(
+                self.token_program.key(),
+                TransferChecked {
+                    from: self.vault.to_account_info(),
+                    to: self.taker_ata_a.to_account_info(),
+                    mint: self.mint_a.to_account_info(),
+                    authority: self.escrow.to_account_info(),
+                },
+                &signer_seeds,
+            ),
+            self.vault.amount, // Withdraws the full balance available in the vault
             self.mint_a.decimals,
         )?;
+
+        // Close the empty vault token account and return its rent lamports back to the maker
+        close_account(CpiContext::new_with_signer(
+            self.token_program.key(),
+            CloseAccount {
+                account: self.vault.to_account_info(),
+                authority: self.escrow.to_account_info(),
+                destination: self.maker.to_account_info(),
+            },
+            &signer_seeds,
+        ))?;
         Ok(())
     }
 }
 
-// the main instruction handler
-pub fn handler(ctx: Context<Make>, seed: u64, receive: u64, amount: u64) -> Result<()> {
-
-    // Validation Checks: Uses require_gt! macro to ensure both the amount requested (receive) and the amount deposited (amount) are strictly greater than 0, returning a custom EscrowError::InvalidAmount if invalid.
-    require_gt!(receive, 0, EscrowError::InvalidAmount);
-    require_gt!(amount, 0, EscrowError::InvalidAmount);
-
-    // State Initialization: Calls populate_escrow to save trade metadata onto the escrow account, passing the automatically generated PDA bump (ctx.bumps.escrow).
-    ctx.accounts
-        .populate_escrow(seed, receive, ctx.bumps.escrow)?;
-
-    // Token Transfer: Calls deposite_tokens to transfer the Maker's tokens into the escrow vault.
-    ctx.accounts.deposite_tokens(amount)?;
+// Main execution handler for the Take instruction
+pub fn handler(ctx: Context<Take>) -> Result<()> {
+    // 1. Send the requested Token B payment from the taker to the maker
+    ctx.accounts.transfer_to_maker()?;
+    
+    // 2. Release Token A to the taker, close the vault, and refund rent to the maker
+    ctx.accounts.withdraw_and_close_vault()?;
     Ok(())
 }
